@@ -45,7 +45,7 @@ const (
 	DEFAULT_NUM_PRODUCTS = 100
 	RESPONSE_DELAY       = time.Millisecond
 
-	QUOTA_LIMIT     = "1000000" // 1m
+	QUOTA_LIMIT     = "10" // 1m
 	QUOTA_INTERVAL  = "1"
 	QUOTA_TIME_UNIT = "minute"
 )
@@ -130,6 +130,8 @@ func (ts *TestServer) Config() server.Config {
 
 func (ts *TestServer) Handler() http.Handler {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	fmt.Println("# Private Key:")
+	fmt.Println(privateKey)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -164,7 +166,6 @@ func (ts *TestServer) Handler() http.Handler {
 			log.Fatal(err)
 		}
 		defer r.Body.Close()
-
 		resp := key.APIKeyResponse{}
 		if product, ok := productsMap[req.APIKey]; ok {
 			resp, err = createVerifyAPIKeyResponse(product, privateKey)
@@ -179,16 +180,21 @@ func (ts *TestServer) Handler() http.Handler {
 	})
 
 	ts.quotas = map[string]*quota.Result{}
+
 	m.HandleFunc("/quotas", func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(RESPONSE_DELAY)
 
 		var req quota.Request
+
 		err := json.NewDecoder(r.Body).Decode(&req)
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer r.Body.Close()
 		ts.quotaLock.Lock()
+
+		fmt.Printf("Quota Request: %+v\n", req)
+		fmt.Printf("Quota Bucket: %+v\n", ts.quotas[req.Identifier])
 		resp, ok := ts.quotas[req.Identifier]
 		if !ok {
 			resp = &quota.Result{}
@@ -262,8 +268,39 @@ func (ts *TestServer) Handler() http.Handler {
 			log.Fatal(err)
 		}
 	})
+	//Generate a JWT access token includes the standard claims and custom claims that are sent by the user request
+	m.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		// var requestBody struct {
+		// 	claims map[string]string
+		// }
+		// if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+		// 	http.Error(w, "Invalid request body", http.StatusBadRequest)
+		// 	return
+		// }
+		token := jwt.New()
+		_ = token.Set(jwt.AudienceKey, "remote-service-client")
+		_ = token.Set(jwt.JwtIDKey, "29e2320b-787c-4625-8599-acc5e05c68d0")
+		_ = token.Set(jwt.IssuerKey, "testserver")
+		_ = token.Set(jwt.NotBeforeKey, time.Now().Add(-10*time.Minute).Unix())
+		_ = token.Set(jwt.IssuedAtKey, time.Now().Unix())
+		_ = token.Set(jwt.ExpirationKey, (time.Now().Add(10 * time.Minute)).Unix())
+		_ = token.Set("access_token", "f2d45913643bccf3ad92998d06aabbd445e5376271b83fc95e5fc8515f59a5e9")
+		_ = token.Set("client_id", "f2d45913643bccf3ad92998d06aabbd445e5376271b83fc95e5fc8515f59a5e9")
+		_ = token.Set("application_name", "application-name")
+		_ = token.Set("api_product_list", []string{productsMap["product-1"].Name})
+		_ = token.Set("scope", "product-1")
 
-	// m.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {})
+		paypal, err := jwt.Sign(token, jwa.RS256, privateKey)
+		if err != nil {
+			http.Error(w, "Failed to sign token", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"access_token": string(paypal),
+		})
+
+	})
 	// m.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {})
 	// m.HandleFunc("/rotate", func(w http.ResponseWriter, r *http.Request) {})
 
@@ -299,17 +336,27 @@ func createProducts(num int) map[string]product.APIProduct {
 		name := fmt.Sprintf("product-%d", i)
 		product := product.APIProduct{
 			Attributes: []product.Attribute{
-				{Name: product.TargetsAttr, Value: name},
+				{Name: "llm-quota-enabled", Value: "true"},
+				{Name: "llm-quota-limit", Value: "10"},
+				{Name: "llm-quota-interval", Value: "1"},
+				{Name: "llm-quota-time-unit", Value: "minute"},
+				{Name: "llm-quota-usage-location", Value: "payload"},
+				{Name: "llm-token-usage-header-name", Value: "x-llm-token-usage"},
+				{Name: "llm-token-usage-payload-json-path", Value: "$.data.llm_info.tokens"},
+				{Name: "llm-quota-" + name + "-limit", Value: "1000"},
+				{Name: product.TargetsAttr, Value: "" + name + ".example.com"},
 			},
 			Description:   name,
 			DisplayName:   name,
 			Environments:  []string{ENV_NAME},
 			Name:          name,
-			Resources:     []string{"/"},
+			Resources:     []string{"/*", "/", "/**"},
 			Scopes:        []string{name},
 			QuotaInterval: QUOTA_INTERVAL,
 			QuotaLimit:    QUOTA_LIMIT,
 			QuotaTimeUnit: QUOTA_TIME_UNIT,
+			APIs:          []string{name + ".example.com"},
+			Proxies:       []string{name + ".example.com"},
 		}
 		products[name] = product
 	}
@@ -329,6 +376,13 @@ func createVerifyAPIKeyResponse(product product.APIProduct, privateKey *rsa.Priv
 	_ = token.Set("client_id", "f2d45913643bccf3ad92998d06aabbd445e5376271b83fc95e5fc8515f59a5e9")
 	_ = token.Set("application_name", "application-name")
 	_ = token.Set("api_product_list", []string{product.Name})
+	customAttributes := map[string]string{
+		"tier":               "standard",
+		"name":               "one",
+		"llm-qoutas-enabled": "true",
+	}
+	customAttributesJSON, _ := json.Marshal(customAttributes)
+	_ = token.Set("custom_attributes", string(customAttributesJSON))
 	payload, err := jwt.Sign(token, jwa.RS256, privateKey)
 
 	return key.APIKeyResponse{Token: string(payload)}, err

@@ -38,6 +38,7 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/reflection"
 )
 
 const (
@@ -160,7 +161,10 @@ func serve(config *server.Config) {
 	// grpc health
 	grpcHealth := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcServer, grpcHealth)
+
 	kubeHealth := server.NewKubeHealth(rsHandler, grpcHealth)
+
+	reflection.Register(grpcServer)
 
 	// grpc listener
 	grpcListener, err := net.Listen("tcp", config.Global.APIAddress)

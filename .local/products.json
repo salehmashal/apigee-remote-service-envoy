@@ -1,0 +1,100 @@
+{
+    "apiProduct": [
+        {
+            "attributes": [
+                {
+                    "name": "apigee-remote-service-targets",
+                    "value": "product-1"
+                }
+            ],
+            "description": "product-1",
+            "displayName": "product-1",
+            "environments": [
+                "test"
+            ],
+            "name": "product-1",
+            "proxies": [
+                "product-1.example.com"
+            ],
+            "quota": "10",
+            "quotaInterval": "1",
+            "quotaTimeUnit": "minute",
+            "apiResources": [
+                "/"
+            ],
+            "scopes": [
+                "product-1"
+            ],
+            "APIs": [
+                "product-1.example.com"
+            ],
+            "EnvironmentMap": null,
+            "QuotaLimitInt": 0,
+            "QuotaIntervalInt": 0
+        },
+        {
+            "attributes": [
+                {
+                    "name": "apigee-remote-service-targets",
+                    "value": "product-2"
+                }
+            ],
+            "description": "product-2",
+            "displayName": "product-2",
+            "environments": [
+                "test"
+            ],
+            "name": "product-2",
+            "proxies": [
+                "product-2.example.com"
+            ],
+            "quota": "10",
+            "quotaInterval": "1",
+            "quotaTimeUnit": "minute",
+            "apiResources": [
+                "/"
+            ],
+            "scopes": [
+                "product-2"
+            ],
+            "APIs": [
+                "product-2.example.com"
+            ],
+            "EnvironmentMap": null,
+            "QuotaLimitInt": 0,
+            "QuotaIntervalInt": 0
+        },
+        {
+            "attributes": [
+                {
+                    "name": "apigee-remote-service-targets",
+                    "value": "product-3"
+                }
+            ],
+            "description": "product-3",
+            "displayName": "product-3",
+            "environments": [
+                "test"
+            ],
+            "name": "product-3",
+            "proxies": [
+                "product-3.example.com"
+            ],
+            "quota": "10",
+            "quotaInterval": "1",
+            "quotaTimeUnit": "minute",
+            "apiResources": [
+                "/"
+            ],
+            "scopes": [
+                "product-3"
+            ],
+            "APIs": [
+                "product-3.example.com"
+            ],
+            "EnvironmentMap": null,
+            "QuotaLimitInt": 0,
+            "QuotaIntervalInt": 0
+        }
+    ]
+}

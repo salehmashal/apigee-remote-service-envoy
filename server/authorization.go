@@ -16,15 +16,20 @@ package server
 
 import (
 	gocontext "context"
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/oliveagle/jsonpath"
 
 	"github.com/apigee/apigee-remote-service-golib/v2/analytics"
 	"github.com/apigee/apigee-remote-service-golib/v2/auth"
 	"github.com/apigee/apigee-remote-service-golib/v2/context"
 	"github.com/apigee/apigee-remote-service-golib/v2/log"
+	"github.com/apigee/apigee-remote-service-golib/v2/product"
 	"github.com/apigee/apigee-remote-service-golib/v2/quota"
 	envoy_auth "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -46,10 +51,45 @@ type AuthorizationServer struct {
 	handler *Handler
 }
 
+type AuthorizedOperation struct {
+	ID            string
+	QuotaLimit    int64
+	QuotaInterval int64
+	QuotaTimeUnit string
+	APIProduct    string
+}
+
+// stringToInt converts a string to an int64
+func stringToInt(s string) int64 {
+	value, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		// Handle the error (e.g., log it or return a default value)
+		return 0 // Default value in case of error
+	}
+	return value
+}
+
 // Register registers
 func (a *AuthorizationServer) Register(s *grpc.Server, handler *Handler) {
 	envoy_auth.RegisterAuthorizationServer(s, a)
 	a.handler = handler
+}
+
+// Check if it is the response of the request flow.
+func isResponseFlow(req *envoy_auth.CheckRequest) bool {
+	// If Envoy calls ext_authz after it has an upstream response, it may set "X-Envoy-Original-Path"
+	// or "x-envoy-original-method" or some other header to indicate the response flow.
+	if _, ok := req.Attributes.Request.Http.Headers["x-envoy-original-path"]; ok {
+		return true
+	}
+
+	// Another heuristic: If the request method is empty or :status is present
+	if req.Attributes.Request.Http.Method == "" &&
+		req.Attributes.Request.Http.Headers[":status"] != "" {
+		return true
+	}
+
+	return false
 }
 
 // Check does check
@@ -123,7 +163,6 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 			}
 		}
 	}
-
 	authContext, err := a.handler.authMan.Authenticate(rootContext, apiKey, claims, a.handler.apiKeyClaim)
 	switch err {
 	case auth.ErrNoAuth:
@@ -137,7 +176,6 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 	if len(authContext.APIProducts) == 0 {
 		return a.denied(req, tracker, authContext, api), nil
 	}
-
 	// authorize against products
 	method := req.Attributes.Request.Http.Method
 	authorizedOps := a.handler.productMan.Authorize(authContext, api, path, method)
@@ -146,10 +184,197 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 	}
 	authContext.AnalyticsProduct = authorizedOps[0].APIProduct
 
+	// fmt.Printf("Authorized API Products: %+v\nAPI Products Custom Attribute : %+v\n", authorizedOps, a.handler.productMan.Products()[authorizedOps[0].APIProduct].Attributes)
+	// fmt.Printf("Authorized Operations %+v", authorizedOps)
+	//LLM Token Quotas
+	productDetails := a.handler.productMan.Products()[authorizedOps[0].APIProduct]
+	var llmQuotaEnabled = false
+	var llmQuotaLimit int64 = 0
+	var llmQuotaInterval int64 = 0
+	var llmQuotaTimeUnit string
+	var llmOp product.AuthorizedOperation
+	var llmQuotaArgs quota.Args
+	var llmTokenExceeded bool
+	var llmTokenAnyError error
+	var llmQuotaUsageLocation string
+	var llmTokenUsageHeaderName string
+	var llmTokenUsagePayloadJsonPath string
+	var llmQuotaLimitClassClaim string = "entitlements"
+	var apiProductKeys map[string]int
+
+	llmQuotaId := "llm-token-" + authorizedOps[0].APIProduct + "-" + authContext.Environment() + "--" + authContext.Application
+	apiProductKeys = make(map[string]int)
+	//Check the llm quota is enabled on the Api product
+	for i, attr := range productDetails.Attributes {
+		apiProductKeys[attr.Name] = i + 1
+		switch attr.Name {
+		case "llm-quota-enabled":
+			llmQuotaEnabled = attr.Value == "true"
+		case "llm-quota-limit":
+			llmQuotaLimit = stringToInt(attr.Value)
+		case "llm-quota-interval":
+			llmQuotaInterval = stringToInt(attr.Value)
+		case "llm-quota-time-unit":
+			llmQuotaTimeUnit = attr.Value
+		case "llm-token-usage-header-name":
+			llmTokenUsageHeaderName = attr.Value
+		case "llm-token-usage-payload-json-path":
+			llmTokenUsagePayloadJsonPath = attr.Value
+		case "llm-quota-usage-location":
+			llmQuotaUsageLocation = attr.Value
+			if llmQuotaUsageLocation != "header" && llmQuotaUsageLocation != "payload" {
+				log.Errorf("`llm-quota-usage-location` custom attribute has an invalid value: %+v, please make sure to provide the location of the llm token usage header or payload", llmQuotaUsageLocation)
+				return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
+			}
+		case "llm-quota-limit-class-claim":
+			llmQuotaLimitClassClaim = attr.Value
+		}
+
+	}
+
+	if llmQuotaEnabled {
+		log.Infof("llm quota is enabled for the product: %+v", productDetails.Name)
+		maxLimit := 0
+		// check if the limit-class-claim is present in jwt metadata
+		var claims map[string]interface{}
+		protoBufStruct := req.Attributes.GetMetadataContext().GetFilterMetadata()[jwtFilterMetadataKey]
+		fieldsMap := protoBufStruct.GetFields()
+
+		if a.handler.jwtProviderKey != "" {
+			claimsStruct, ok := fieldsMap[a.handler.jwtProviderKey]
+			if ok {
+				log.Debugf("Using JWT at provider key: %s", a.handler.jwtProviderKey)
+				claims = DecodeToMap(claimsStruct.GetStructValue())
+			}
+		} else {
+			for k, v := range fieldsMap {
+				vFields := v.GetStructValue().GetFields()
+				if vFields[a.handler.apiKeyClaim] != nil || vFields["api_product_list"] != nil {
+					log.Debugf("Using JWT with provider key: %s", k)
+					claims = DecodeToMap(v.GetStructValue())
+				}
+			}
+		}
+		if claims != nil {
+			if _, ok := claims[llmQuotaLimitClassClaim]; ok {
+				//retrieve the array of values
+				classes, ok := claims[llmQuotaLimitClassClaim].([]interface{})
+				if !ok {
+					log.Warnf("llmQuotaLimitClassClaim: %s is not an array of string in JWT claims", llmQuotaLimitClassClaim)
+				} else {
+					for _, class := range classes {
+						className, ok := class.(string)
+						if !ok {
+							log.Warnf("llmQuotaLimitClassClaim: %s value is not a string: %v", llmQuotaLimitClassClaim, class)
+							continue
+						}
+
+						if apiProductKeys["llm-quota-"+className+"-limit"] > 0 {
+							index := apiProductKeys["llm-quota-"+className+"-limit"] - 1
+							limit := productDetails.Attributes[index].Value
+							if stringToInt(limit) > int64(maxLimit) {
+								maxLimit = int(stringToInt(limit))
+							}
+						}
+					}
+				}
+			}
+		} else {
+			log.Warnf("Unable to retrieve claims")
+		}
+		llmQuotaLimit = int64(maxLimit)
+		//check if pre-check or deduct
+		if isResponseFlow(req) {
+			fmt.Print("test1")
+			var llmTokensConsumed int64
+
+			if llmQuotaUsageLocation == "" {
+				log.Errorf("`llm-quota-usage-location` custom attribute has an invalid value or not set: %+v, please make sure to provide the location of the llm token usage header or payload", llmQuotaUsageLocation)
+				return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
+			} else {
+				if llmTokenUsagePayloadJsonPath == "" && llmQuotaUsageLocation == "payload" {
+					log.Errorf("`llm-token-usage-payload-json-path` custom attribute is not set please make sure to set the correct json path")
+					return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
+				} else if llmQuotaUsageLocation == "payload" {
+					if req.Attributes.Request.Http.Body == "" {
+						log.Errorf("`llm-token-usage-payload-json-path` body is empty")
+						llmTokensConsumed = 1
+					} else {
+						var data interface{}
+						err := json.Unmarshal([]byte(req.Attributes.Request.Http.Body), &data)
+						if err != nil {
+							log.Errorf("Failed to unmarshal request body: %v", err)
+							llmTokensConsumed = 1
+						} else {
+							res, err := jsonpath.JsonPathLookup(data, llmTokenUsagePayloadJsonPath)
+							if err != nil {
+								log.Errorf("Error extracting data from JSON payload using path %s: %v", llmTokenUsagePayloadJsonPath, err)
+								llmTokensConsumed = 1
+							} else {
+								if val, ok := res.(float64); ok {
+									llmTokensConsumed = int64(val)
+								} else if val, ok := res.(int64); ok {
+									llmTokensConsumed = val
+								} else if val, ok := res.(int); ok {
+									llmTokensConsumed = int64(val)
+								} else if val, ok := res.(string); ok {
+									llmTokensConsumed = stringToInt(val)
+								} else {
+									log.Errorf("`llm-token-usage-payload-json-path` custom attribute has an invalid value: %+v, please make sure to provide a value compatible with integer", res)
+									llmTokensConsumed = 1
+								}
+							}
+						}
+					}
+
+				}
+				if llmTokenUsageHeaderName == "" && llmQuotaUsageLocation == "header" {
+					log.Errorf("`llm-token-usage-header-name` custom attribute is not set please make sure to set the correct header name")
+					return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
+				} else if llmQuotaUsageLocation == "header" && llmTokenUsageHeaderName != "" {
+					if req.Attributes.Request.Http.Headers[llmTokenUsageHeaderName] != "" {
+						llmTokensConsumed = stringToInt(req.Attributes.Request.Http.Headers[llmTokenUsageHeaderName])
+					} else {
+						llmTokensConsumed = 1
+					}
+				}
+			}
+
+			llmQuotaArgs = quota.Args{QuotaAmount: llmTokensConsumed}
+
+		} else {
+			//Pass the weight of the request to zero just to check the quota is exceeded or not
+			llmQuotaArgs = quota.Args{QuotaAmount: 0}
+		}
+		llmOp = product.AuthorizedOperation{
+			ID:            llmQuotaId,
+			APIProduct:    authorizedOps[0].APIProduct,
+			QuotaLimit:    llmQuotaLimit,
+			QuotaInterval: llmQuotaInterval,
+			QuotaTimeUnit: llmQuotaTimeUnit,
+		}
+		if llmOp.QuotaLimit > 0 {
+			result, err := a.handler.quotaMan.Apply(authContext, llmOp, llmQuotaArgs)
+			if err != nil {
+				log.Errorf("llm token quota check: %v", err)
+				llmTokenAnyError = err
+			} else if result.Exceeded > 0 {
+				log.Debugf("llm token quota exceeded: %v", llmOp.ID)
+				llmTokenExceeded = true
+			}
+		}
+
+		if llmTokenAnyError != nil {
+			return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
+		}
+		if llmTokenExceeded {
+			return a.quotaExceeded(req, tracker, authContext, api), nil
+		}
+	}
 	// apply quotas to matched operations
-	var quotaArgs = quota.Args{QuotaAmount: 1}
 	var exceeded bool
 	var anyError error
+	var quotaArgs = quota.Args{QuotaAmount: 1}
 	for _, op := range authorizedOps {
 		if op.QuotaLimit > 0 {
 			result, err := a.handler.quotaMan.Apply(authContext, op, quotaArgs)

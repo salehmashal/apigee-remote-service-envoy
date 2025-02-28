@@ -131,6 +131,8 @@ func NewHandler(config *Config) (*Handler, error) {
 		return nil, err
 	}
 
+	//llm token quota usage metadata
+
 	productMan, err := product.NewManager(product.Options{
 		Client:      instrumentedClientFor(config, "products", tr),
 		BaseURL:     remoteServiceAPI,

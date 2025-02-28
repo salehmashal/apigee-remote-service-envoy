@@ -1,0 +1,70 @@
+grpcurl -plaintext -vv  \
+  -d '{
+    "attributes": {
+      "request": {
+        "http": {
+          "method": "POST",
+          "path": "/v1",
+          "host": "product-1.example.com",
+          "headers": {
+            ":authority": "product-1.example.com",
+            ":method": "POST",
+            ":path": "/v1",
+            "Authorization": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3NfdG9rZW4iOiJmMmQ0NTkxMzY0M2JjY2YzYWQ5Mjk5OGQwNmFhYmJkNDQ1ZTUzNzYyNzFiODNmYzk1ZTVmYzg1MTVmNTlhNWU5IiwiYXBpX3Byb2R1Y3RfbGlzdCI6WyJwcm9kdWN0LTEiXSwiYXBwbGljYXRpb25fbmFtZSI6ImFwcGxpY2F0aW9uLW5hbWUiLCJhdWQiOlsicmVtb3RlLXNlcnZpY2UtY2xpZW50Il0sImNsaWVudF9pZCI6ImYyZDQ1OTEzNjQzYmNjZjNhZDkyOTk4ZDA2YWFiYmQ0NDVlNTM3NjI3MWI4M2ZjOTVlNWZjODUxNWY1OWE1ZTkiLCJleHAiOjE3NDA1MTMzNTUsImlhdCI6MTc0MDUxMjc1NSwiaXNzIjoidGVzdHNlcnZlciIsImp0aSI6IjI5ZTIzMjBiLTc4N2MtNDYyNS04NTk5LWFjYzVlMDVjNjhkMCIsIm5iZiI6MTc0MDUxMjE1NSwic2NvcGUiOiJwcm9kdWN0LTEifQ.GD0GZx1mt-xxEu1G0rlNt_JL5rWyTWqLq7pT6Rtj5bD3rfSxrJNl1m2wEFaBgmbKeZtY1xWom-lfXHcU-w8bmfn_yoCdTbG3Mw9fhp9GNMNDAbqttln6RQ7vhElpzSR8_7f-n9f7t9TCWv4Fxn-2qfzpPB3TtpYBVJIy_mdKtdqg4sXw-ytvgUm8TzCurnBedw_qQU-HkU-Ggx4OdziO4xDfiHWQUZpOJpRzAiLQU8UmpJKDt_iGMx6Mp6EKq_Ku2CnZJ6KjGGRpb60ZBeTPhia3DF1aWjySVG6tSEVFPXAaqjqlzi_5jZS68EyDF-9Yvi57lDEkEnDFETdEDPM7yQ",
+            "content-type": "application/json",
+            "user-agent": "Envoy/1.21",
+            "x-forwarded-for": "192.168.1.100",
+            "x-request-id": "b7c3f5c0-1234-5678-abcd-ef1234567890"
+          },
+          "protocol": "HTTP/1.1"
+        }
+      },
+      "source": {
+        "address": {
+          "socketAddress": {
+            "address": "192.168.1.100",
+            "portValue": 54321
+          }
+        }
+      },
+      "destination": {
+        "address": {
+          "socketAddress": {
+            "address": "10.0.0.1",
+            "portValue": 443
+          }
+        }
+      },
+      "contextExtensions": {
+        "apigee_environment": "test",
+        "jwt.claims.email": "user@example.com",
+        "jwt.claims.sub": "1234567890",
+        "jwt.claims.iss": "https://auth.example.com"
+      },
+      "metadataContext": {
+        "filterMetadata": {
+          "envoy.filters.http.jwt_authn": {
+            "jwt": {
+                "access_token": "f2d45913643bccf3ad92998d06aabbd445e5376271b83fc95e5fc8515f59a5e9",
+                "api_product_list": [
+                    "product-1",
+                    "product-2"
+                ],
+                "application_name": "appName",
+                "aud": [
+                    "remote-service-client"
+                ],
+                "client_id": "f2d45913643bccf3ad92998d06aabbd445e5376271b83fc95e5fc8515f59a5e9",
+                "exp": 1740513355,
+                "iat": 1740512755,
+                "iss": "testserver",
+                "jti": "29e2320b-787c-4625-8599-acc5e05c68d0",
+                "nbf": 1740512155,
+                "scope": "product-1 product-2 product-3"
+                }
+          }
+        }
+      }
+    }
+  }' \
+  localhost:5000 envoy.service.auth.v3.Authorization/Check

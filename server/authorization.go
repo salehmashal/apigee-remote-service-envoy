@@ -16,14 +16,11 @@ package server
 
 import (
 	gocontext "context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/oliveagle/jsonpath"
 
 	"github.com/apigee/apigee-remote-service-golib/v2/analytics"
 	"github.com/apigee/apigee-remote-service-golib/v2/auth"
@@ -59,6 +56,16 @@ type AuthorizedOperation struct {
 	APIProduct    string
 }
 
+type LLMTokenQuotaAttributes struct {
+	AuthorizedOperation          product.AuthorizedOperation `json:"authorized_operation"`
+	LlmQuotaUsageLocation        string                      `json:"llm_quota_usage_location"`
+	LlmTokenUsageHeaderName      string                      `json:"llm_token_usage_header_name"`
+	LlmTokenUsagePayloadJsonPath string                      `json:"llm_token_usage_payload_json_path"`
+	LlmQuotaEnabled              bool                        `json:"llm_quota_enabled"`
+	AuthContextAPIKey            string                      `json:"auth_context_api_key"`
+	AuthContextClaims            map[string]interface{}      `json:"auth_context_claims"`
+}
+
 // stringToInt converts a string to an int64
 func stringToInt(s string) int64 {
 	value, err := strconv.ParseInt(s, 10, 64)
@@ -79,7 +86,7 @@ func (a *AuthorizationServer) Register(s *grpc.Server, handler *Handler) {
 func isResponseFlow(req *envoy_auth.CheckRequest) bool {
 	// If Envoy calls ext_authz after it has an upstream response, it may set "X-Envoy-Original-Path"
 	// or "x-envoy-original-method" or some other header to indicate the response flow.
-	if _, ok := req.Attributes.Request.Http.Headers["x-envoy-original-path"]; ok {
+	if _, ok := req.Attributes.Request.Http.Headers["x-envoy-expected-rq-timeout-ms"]; ok {
 		return true
 	}
 
@@ -94,9 +101,11 @@ func isResponseFlow(req *envoy_auth.CheckRequest) bool {
 
 // Check does check
 func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.CheckRequest) (*envoy_auth.CheckResponse, error) {
-
+	fmt.Printf("Request is: %+v \n", req)
 	var rootContext context.Context = a.handler
 	var err error
+	var llmTokenQuotaAttributes LLMTokenQuotaAttributes
+
 	envFromEnvoy, envFromEnvoyExists := req.Attributes.ContextExtensions[envContextKey]
 	if a.handler.isMultitenant {
 		if envFromEnvoyExists && envFromEnvoy != "" {
@@ -144,7 +153,7 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 	} else { // otherwise iterate over apiKeyClaim loop
 		for k, v := range fieldsMap {
 			vFields := v.GetStructValue().GetFields()
-			if vFields[a.handler.apiKeyClaim] != nil || vFields["api_product_list"] != nil {
+			if vFields[a.handler.apiKeyClaim] != nil || vFields["api_product_list"] != nil || vFields["product_list"] != nil {
 				log.Debugf("Using JWT with provider key: %s", k)
 				claims = DecodeToMap(v.GetStructValue())
 			}
@@ -183,9 +192,6 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 		return a.denied(req, tracker, authContext, api), nil
 	}
 	authContext.AnalyticsProduct = authorizedOps[0].APIProduct
-
-	// fmt.Printf("Authorized API Products: %+v\nAPI Products Custom Attribute : %+v\n", authorizedOps, a.handler.productMan.Products()[authorizedOps[0].APIProduct].Attributes)
-	// fmt.Printf("Authorized Operations %+v", authorizedOps)
 	//LLM Token Quotas
 	productDetails := a.handler.productMan.Products()[authorizedOps[0].APIProduct]
 	var llmQuotaEnabled = false
@@ -212,6 +218,9 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 			llmQuotaEnabled = attr.Value == "true"
 		case "llm-quota-limit":
 			llmQuotaLimit = stringToInt(attr.Value)
+			if llmQuotaLimit > 0 {
+				fmt.Printf("LLM quota limit set to: %d", llmQuotaLimit)
+			}
 		case "llm-quota-interval":
 			llmQuotaInterval = stringToInt(attr.Value)
 		case "llm-quota-time-unit":
@@ -234,7 +243,6 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 
 	if llmQuotaEnabled {
 		log.Infof("llm quota is enabled for the product: %+v", productDetails.Name)
-		maxLimit := 0
 		// check if the limit-class-claim is present in jwt metadata
 		var claims map[string]interface{}
 		protoBufStruct := req.Attributes.GetMetadataContext().GetFilterMetadata()[jwtFilterMetadataKey]
@@ -249,109 +257,97 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 		} else {
 			for k, v := range fieldsMap {
 				vFields := v.GetStructValue().GetFields()
-				if vFields[a.handler.apiKeyClaim] != nil || vFields["api_product_list"] != nil {
+				if vFields[a.handler.apiKeyClaim] != nil || vFields["api_product_list"] != nil || vFields["product_list"] != nil {
 					log.Debugf("Using JWT with provider key: %s", k)
 					claims = DecodeToMap(v.GetStructValue())
 				}
 			}
 		}
+		var bestRate float64
+		var bestLimit = llmQuotaLimit // from “llm-quota-limit”
+		var bestInterval = llmQuotaInterval
+		var bestTimeUnit = llmQuotaTimeUnit
+
 		if claims != nil {
-			if _, ok := claims[llmQuotaLimitClassClaim]; ok {
-				//retrieve the array of values
-				classes, ok := claims[llmQuotaLimitClassClaim].([]interface{})
-				if !ok {
-					log.Warnf("llmQuotaLimitClassClaim: %s is not an array of string in JWT claims", llmQuotaLimitClassClaim)
-				} else {
-					for _, class := range classes {
-						className, ok := class.(string)
-						if !ok {
-							log.Warnf("llmQuotaLimitClassClaim: %s value is not a string: %v", llmQuotaLimitClassClaim, class)
-							continue
-						}
+			if classes, ok := claims[llmQuotaLimitClassClaim].([]interface{}); ok {
+				for _, c := range classes {
+					className, ok := c.(string)
+					if !ok {
+						continue
+					}
+					limitKey := "llm-quota-" + className + "-limit"
+					intervalKey := "llm-quota-" + className + "-interval"
+					timeUnitKey := "llm-quota-" + className + "-time-unit"
 
-						if apiProductKeys["llm-quota-"+className+"-limit"] > 0 {
-							index := apiProductKeys["llm-quota-"+className+"-limit"] - 1
-							limit := productDetails.Attributes[index].Value
-							if stringToInt(limit) > int64(maxLimit) {
-								maxLimit = int(stringToInt(limit))
-							}
-						}
+					var limitVal int64
+					var intervalVal int64
+					var timeUnitVal string
+
+					if idxLimit, found := apiProductKeys[limitKey]; found {
+						limitVal = stringToInt(productDetails.Attributes[idxLimit-1].Value)
+					}
+					if idxInterval, found := apiProductKeys[intervalKey]; found {
+						intervalVal = stringToInt(productDetails.Attributes[idxInterval-1].Value)
+					}
+					if idxTimeUnit, found := apiProductKeys[timeUnitKey]; found {
+						timeUnitVal = productDetails.Attributes[idxTimeUnit-1].Value
+					}
+
+					// skip if missing or invalid
+					if limitVal <= 0 || intervalVal <= 0 {
+						continue
+					}
+					secs := intervalInSeconds(intervalVal, timeUnitVal)
+					if secs == 0 {
+						continue
+					}
+					// tokens per second
+					rate := float64(limitVal) / float64(secs)
+
+					if rate > bestRate {
+						bestRate = rate
+						bestLimit = limitVal
+						bestInterval = intervalVal
+						bestTimeUnit = timeUnitVal
 					}
 				}
 			}
-		} else {
-			log.Warnf("Unable to retrieve claims")
 		}
-		llmQuotaLimit = int64(maxLimit)
-		//check if pre-check or deduct
-		if isResponseFlow(req) {
-			fmt.Print("test1")
-			var llmTokensConsumed int64
 
-			if llmQuotaUsageLocation == "" {
-				log.Errorf("`llm-quota-usage-location` custom attribute has an invalid value or not set: %+v, please make sure to provide the location of the llm token usage header or payload", llmQuotaUsageLocation)
-				return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
-			} else {
-				if llmTokenUsagePayloadJsonPath == "" && llmQuotaUsageLocation == "payload" {
-					log.Errorf("`llm-token-usage-payload-json-path` custom attribute is not set please make sure to set the correct json path")
-					return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
-				} else if llmQuotaUsageLocation == "payload" {
-					if req.Attributes.Request.Http.Body == "" {
-						log.Errorf("`llm-token-usage-payload-json-path` body is empty")
-						llmTokensConsumed = 1
-					} else {
-						var data interface{}
-						err := json.Unmarshal([]byte(req.Attributes.Request.Http.Body), &data)
-						if err != nil {
-							log.Errorf("Failed to unmarshal request body: %v", err)
-							llmTokensConsumed = 1
-						} else {
-							res, err := jsonpath.JsonPathLookup(data, llmTokenUsagePayloadJsonPath)
-							if err != nil {
-								log.Errorf("Error extracting data from JSON payload using path %s: %v", llmTokenUsagePayloadJsonPath, err)
-								llmTokensConsumed = 1
-							} else {
-								if val, ok := res.(float64); ok {
-									llmTokensConsumed = int64(val)
-								} else if val, ok := res.(int64); ok {
-									llmTokensConsumed = val
-								} else if val, ok := res.(int); ok {
-									llmTokensConsumed = int64(val)
-								} else if val, ok := res.(string); ok {
-									llmTokensConsumed = stringToInt(val)
-								} else {
-									log.Errorf("`llm-token-usage-payload-json-path` custom attribute has an invalid value: %+v, please make sure to provide a value compatible with integer", res)
-									llmTokensConsumed = 1
-								}
-							}
-						}
-					}
-
-				}
-				if llmTokenUsageHeaderName == "" && llmQuotaUsageLocation == "header" {
-					log.Errorf("`llm-token-usage-header-name` custom attribute is not set please make sure to set the correct header name")
-					return a.internalError(req, tracker, authContext, api, llmTokenAnyError), nil
-				} else if llmQuotaUsageLocation == "header" && llmTokenUsageHeaderName != "" {
-					if req.Attributes.Request.Http.Headers[llmTokenUsageHeaderName] != "" {
-						llmTokensConsumed = stringToInt(req.Attributes.Request.Http.Headers[llmTokenUsageHeaderName])
-					} else {
-						llmTokensConsumed = 1
-					}
-				}
+		// if bestRate is bigger than 0, we found something.
+		// Compare with your default “llmQuotaLimit”
+		if bestRate > 0 {
+			// Replace your existing llmQuotaLimit with whichever is bigger
+			// if you want to prefer the “class-based” config only if it truly
+			// outperforms the normal llmQuotaLimit. If you always want “class-based”
+			// to override, then just do it unconditionally.
+			defaultSecs := intervalInSeconds(llmQuotaInterval, llmQuotaTimeUnit)
+			defaultRate := float64(llmQuotaLimit) / float64(defaultSecs)
+			if bestRate > defaultRate {
+				llmQuotaLimit = bestLimit
+				llmQuotaInterval = bestInterval
+				llmQuotaTimeUnit = bestTimeUnit
 			}
-
-			llmQuotaArgs = quota.Args{QuotaAmount: llmTokensConsumed}
-
-		} else {
-			//Pass the weight of the request to zero just to check the quota is exceeded or not
-			llmQuotaArgs = quota.Args{QuotaAmount: 0}
 		}
+
+		llmQuotaArgs = quota.Args{QuotaAmount: 0}
 		llmOp = product.AuthorizedOperation{
 			ID:            llmQuotaId,
 			APIProduct:    authorizedOps[0].APIProduct,
 			QuotaLimit:    llmQuotaLimit,
 			QuotaInterval: llmQuotaInterval,
 			QuotaTimeUnit: llmQuotaTimeUnit,
+		}
+
+		//Pass the llm Qouta to the ext_proc through dynamic metadata
+		llmTokenQuotaAttributes = LLMTokenQuotaAttributes{
+			LlmQuotaEnabled:              llmQuotaEnabled,
+			AuthorizedOperation:          llmOp,
+			LlmQuotaUsageLocation:        llmQuotaUsageLocation,
+			LlmTokenUsageHeaderName:      llmTokenUsageHeaderName,
+			LlmTokenUsagePayloadJsonPath: llmTokenUsagePayloadJsonPath,
+			AuthContextAPIKey:            string(apiKey),
+			AuthContextClaims:            claims,
 		}
 		if llmOp.QuotaLimit > 0 {
 			result, err := a.handler.quotaMan.Apply(authContext, llmOp, llmQuotaArgs)
@@ -394,15 +390,15 @@ func (a *AuthorizationServer) Check(ctx gocontext.Context, req *envoy_auth.Check
 		return a.quotaExceeded(req, tracker, authContext, api), nil
 	}
 
-	return a.authOK(tracker, authContext, api), nil
+	return a.authOK(tracker, authContext, api, llmTokenQuotaAttributes), nil
 }
 
-func (a *AuthorizationServer) authOK(tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string) *envoy_auth.CheckResponse {
+func (a *AuthorizationServer) authOK(tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string, llmTokenQuotaAttributes LLMTokenQuotaAttributes) *envoy_auth.CheckResponse {
 
 	okResponse := &envoy_auth.OkHttpResponse{}
 
 	if a.handler.appendMetadataHeaders {
-		headers := makeMetadataHeaders(api, authContext, true)
+		headers := makeMetadataHeaders(api, authContext, true, &llmTokenQuotaAttributes)
 		okResponse.Headers = headers
 	}
 
@@ -414,28 +410,28 @@ func (a *AuthorizationServer) authOK(tracker *prometheusRequestMetricTracker, au
 		HttpResponse: &envoy_auth.CheckResponse_OkResponse{
 			OkResponse: okResponse,
 		},
-		DynamicMetadata: encodeExtAuthzMetadata(api, authContext, true),
+		DynamicMetadata: encodeExtAuthzMetadata(api, authContext, true, &llmTokenQuotaAttributes),
 	}
 }
 
 func (a *AuthorizationServer) unauthorized(req *envoy_auth.CheckRequest, tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string) *envoy_auth.CheckResponse {
-	return a.createDenyResponse(req, tracker, authContext, api, rpc.UNAUTHENTICATED)
+	return a.createDenyResponse(req, tracker, authContext, api, rpc.UNAUTHENTICATED, nil)
 }
 
 func (a *AuthorizationServer) internalError(req *envoy_auth.CheckRequest, tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string, err error) *envoy_auth.CheckResponse {
 	log.Errorf("sending internal error: %v", err)
-	return a.createDenyResponse(req, tracker, authContext, api, rpc.INTERNAL)
+	return a.createDenyResponse(req, tracker, authContext, api, rpc.INTERNAL, nil)
 }
 
 func (a *AuthorizationServer) denied(req *envoy_auth.CheckRequest, tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string) *envoy_auth.CheckResponse {
-	return a.createDenyResponse(req, tracker, authContext, api, rpc.PERMISSION_DENIED)
+	return a.createDenyResponse(req, tracker, authContext, api, rpc.PERMISSION_DENIED, nil)
 }
 
 func (a *AuthorizationServer) quotaExceeded(req *envoy_auth.CheckRequest, tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string) *envoy_auth.CheckResponse {
-	return a.createDenyResponse(req, tracker, authContext, api, rpc.RESOURCE_EXHAUSTED)
+	return a.createDenyResponse(req, tracker, authContext, api, rpc.RESOURCE_EXHAUSTED, nil)
 }
 
-func (a *AuthorizationServer) createDenyResponse(req *envoy_auth.CheckRequest, tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string, code rpc.Code) *envoy_auth.CheckResponse {
+func (a *AuthorizationServer) createDenyResponse(req *envoy_auth.CheckRequest, tracker *prometheusRequestMetricTracker, authContext *auth.Context, api string, code rpc.Code, llmTokenQuotaAttributes *LLMTokenQuotaAttributes) *envoy_auth.CheckResponse {
 
 	// use intended code, not OK
 	switch code {
@@ -460,7 +456,7 @@ func (a *AuthorizationServer) createDenyResponse(req *envoy_auth.CheckRequest, t
 				Code: int32(code),
 			},
 			// Envoy won't deliver this, so commenting it out for now. See below.
-			// DynamicMetadata: encodeExtAuthzMetadata(api, authContext, false),
+			DynamicMetadata: encodeExtAuthzMetadata(api, authContext, false, llmTokenQuotaAttributes),
 		}
 
 		// Envoy automatically maps the other response status codes,
@@ -516,7 +512,7 @@ func (a *AuthorizationServer) createDenyResponse(req *envoy_auth.CheckRequest, t
 	okResponse := &envoy_auth.OkHttpResponse{}
 
 	if a.handler.appendMetadataHeaders {
-		headers := makeMetadataHeaders(api, authContext, false)
+		headers := makeMetadataHeaders(api, authContext, false, llmTokenQuotaAttributes)
 		okResponse.Headers = headers
 	}
 
@@ -529,7 +525,7 @@ func (a *AuthorizationServer) createDenyResponse(req *envoy_auth.CheckRequest, t
 		HttpResponse: &envoy_auth.CheckResponse_OkResponse{
 			OkResponse: okResponse,
 		},
-		DynamicMetadata: encodeExtAuthzMetadata(api, authContext, false),
+		DynamicMetadata: encodeExtAuthzMetadata(api, authContext, false, llmTokenQuotaAttributes),
 	}
 }
 
@@ -572,4 +568,18 @@ type multitenantContext struct {
 
 func (o *multitenantContext) Environment() string {
 	return o.env
+}
+
+func intervalInSeconds(interval int64, timeUnit string) int64 {
+	switch strings.ToLower(timeUnit) {
+	case "minute", "min":
+		return interval * 60
+	case "hour", "hr":
+		return interval * 3600
+	case "day":
+		return interval * 86400
+	default:
+		// fallback
+		return interval * 60 // assume "minute" if unknown
+	}
 }

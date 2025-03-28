@@ -3,9 +3,10 @@
 [![codecov.io](https://codecov.io/github/apigee/apigee-remote-service-envoy/coverage.svg?)](https://codecov.io/github/apigee/apigee-remote-service-envoy)
 [![In Solidarity](https://github.com/jpoehnelt/in-solidarity-bot/raw/main/static/badge-flat.png)](https://github.com/apps/in-solidarity)
 
-# Apigee Remote Service for Envoy
 
-This project exposes standard Envoy gRPC endpoints for the `External Authorization (ext-authz)`
+# [Custom] Apigee Remote Service for Envoy
+
+This project exposes standard Envoy gRPC endpoints for the `External Authorization (ext-authz)`, `External Processing (ext-proc) for llm token quota` 
 and `gRPC Access Log Service (ALS)` interfaces. Thus, it allows Envoy to be used as a limited
 remote API Gateway extension to an Apigee environment. Features directly supported include:
 authentication and authorization via API Key or JWT OAuth Tokens, Distributed Quota, and Analytics.

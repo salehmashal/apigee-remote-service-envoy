@@ -15,6 +15,8 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/apigee/apigee-remote-service-golib/v2/auth"
@@ -23,7 +25,7 @@ import (
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 )
 
-func makeMetadataHeaders(api string, ac *auth.Context, authorized bool) []*core.HeaderValueOption {
+func makeMetadataHeaders(api string, ac *auth.Context, authorized bool, llmTokenQuotaAttributes *LLMTokenQuotaAttributes) []*core.HeaderValueOption {
 	if ac == nil {
 		return nil
 	}
@@ -40,6 +42,17 @@ func makeMetadataHeaders(api string, ac *auth.Context, authorized bool) []*core.
 		header(headerScope, strings.Join(ac.Scopes, " ")),
 		header(headerAnalyticsProduct, ac.AnalyticsProduct),
 	}
+	// Serialize the req parameter and add it to the fields map
+	if llmTokenQuotaAttributes != nil {
+		reqJSON, err := json.Marshal(llmTokenQuotaAttributes)
+		if err != nil {
+			// Handle the error, e.g., log it or return an error
+			fmt.Printf("Failed to marshal CheckRequest: %v", err)
+		} else {
+			headers = append(headers, header(headerLLMQuotaAttributes, string(reqJSON)))
+		}
+	}
+
 	if ac.CustomAttributes != "" {
 		headers = append(headers, header(headerCustomAttributes, ac.CustomAttributes))
 	}

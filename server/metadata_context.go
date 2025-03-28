@@ -15,34 +15,38 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/apigee/apigee-remote-service-golib/v2/auth"
 	"github.com/apigee/apigee-remote-service-golib/v2/context"
 	"github.com/apigee/apigee-remote-service-golib/v2/log"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
 	extAuthzFilterNamespace = "envoy.filters.http.ext_authz"
 
-	headerAuthorized       = "x-apigee-authorized"
-	headerAccessToken      = "x-apigee-accesstoken"
-	headerAPI              = "x-apigee-api"
-	headerAPIProducts      = "x-apigee-apiproducts"
-	headerApplication      = "x-apigee-application"
-	headerClientID         = "x-apigee-clientid"
-	headerDeveloperEmail   = "x-apigee-developeremail"
-	headerEnvironment      = "x-apigee-environment"
-	headerOrganization     = "x-apigee-organization"
-	headerScope            = "x-apigee-scope"
-	headerCustomAttributes = "x-apigee-customattributes"
-	headerAnalyticsProduct = "x-apigee-analytics-product"
+	headerAuthorized         = "x-apigee-authorized"
+	headerAccessToken        = "x-apigee-accesstoken"
+	headerAPI                = "x-apigee-api"
+	headerAPIProducts        = "x-apigee-apiproducts"
+	headerApplication        = "x-apigee-application"
+	headerClientID           = "x-apigee-clientid"
+	headerDeveloperEmail     = "x-apigee-developeremail"
+	headerEnvironment        = "x-apigee-environment"
+	headerOrganization       = "x-apigee-organization"
+	headerScope              = "x-apigee-scope"
+	headerCustomAttributes   = "x-apigee-customattributes"
+	headerAnalyticsProduct   = "x-apigee-analytics-product"
+	headerLLMQuotaAttributes = "x-apigee-llm-quota-attributes"
 )
 
 // encodeExtAuthzMetadata encodes given api and auth context into
 // Envoy ext_authz's filter's dynamic metadata
-func encodeExtAuthzMetadata(api string, ac *auth.Context, authorized bool) *structpb.Struct {
+func encodeExtAuthzMetadata(api string, ac *auth.Context, authorized bool, llmTokenQuotaAttributes *LLMTokenQuotaAttributes) *structpb.Struct {
 	if ac == nil {
 		return nil
 	}
@@ -68,10 +72,22 @@ func encodeExtAuthzMetadata(api string, ac *auth.Context, authorized bool) *stru
 		fields[headerAuthorized] = stringValueFrom("true")
 	}
 
+	// Serialize the req parameter and add it to the fields map
+	if llmTokenQuotaAttributes != nil {
+		reqJSON, err := json.Marshal(llmTokenQuotaAttributes)
+		reqContext, err := json.Marshal(ac)
+		if err != nil {
+			// Handle the error, e.g., log it or return an error
+			fmt.Printf("Failed to marshal CheckRequest: %v", err)
+		} else {
+			fields[headerLLMQuotaAttributes] = stringValueFrom(string(reqJSON))
+			fields["context"] = stringValueFrom(string(reqContext))
+		}
+	}
+
 	return &structpb.Struct{
 		Fields: fields,
 	}
-
 }
 
 // stringValueFrom returns a *structpb.Value with a StringValue Kind
@@ -104,6 +120,23 @@ func structValueFrom(v struct{}) *structpb.Value {
 		Kind: &structpb.Value_StructValue{
 			StructValue: &structpb.Struct{},
 		},
+	}
+}
+
+func structProtoValueFrom(v proto.Message) *structpb.Value {
+	bytes, err := proto.Marshal(v)
+	if err != nil {
+		log.Errorf("Error marshaling proto message: %v", err)
+		return &structpb.Value{} // Return empty struct on failure
+	}
+	var structVal structpb.Struct
+	err = proto.Unmarshal(bytes, &structVal)
+	if err != nil {
+		log.Errorf("Error unmarshaling into Struct: %v", err)
+		return &structpb.Value{}
+	}
+	return &structpb.Value{
+		Kind: &structpb.Value_StructValue{StructValue: &structVal},
 	}
 }
 
